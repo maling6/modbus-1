@@ -14,6 +14,12 @@ type ServerConfiguration struct {
 	Timeout		time.Duration	// idle session timeout (client connection will be
 					// closed if idle for this long)
 	MaxClients	uint		// maximum number of concurrent client connections
+
+	Speed		uint
+	DataBits	uint
+	Parity		uint
+	StopBits	uint
+	AcceptedUnitIds	[]uint8
 }
 
 // The RequestHandler interface should be implemented by the handler
@@ -128,6 +134,40 @@ func NewServer(conf *ServerConfiguration, reqHandler RequestHandler) (ms *Modbus
 	}
 
 	switch {
+	case strings.HasPrefix(ms.conf.URL, "rtu://"):
+		ms.conf.URL	= strings.TrimPrefix(ms.conf.URL, "rtu://")
+
+		// set useful defaults
+		if ms.conf.Speed == 0 {
+			ms.conf.Speed	= 9600
+		}
+
+		if ms.conf.DataBits == 0 {
+			ms.conf.DataBits = 8
+		}
+
+		if ms.conf.StopBits == 0 {
+			if ms.conf.Parity == PARITY_NONE {
+				ms.conf.StopBits = 2
+			} else {
+				ms.conf.StopBits = 1
+			}
+		}
+
+		if ms.conf.Timeout == 0 {
+			ms.conf.Timeout = 30 * time.Second
+		}
+
+		// ensure we have at least one configured unit ID to tune into
+		if len(ms.conf.AcceptedUnitIds) == 0 {
+			ms.logger.Errorf("at least 1 unit id must be configured " +
+					 "with the RTU transport")
+			err = ErrConfigurationError
+			return
+		}
+
+		ms.transportType	= RTU_TRANSPORT
+
 	case strings.HasPrefix(ms.conf.URL, "tcp://"):
 		ms.conf.URL	= strings.TrimPrefix(ms.conf.URL, "tcp://")
 
@@ -153,6 +193,8 @@ func NewServer(conf *ServerConfiguration, reqHandler RequestHandler) (ms *Modbus
 
 // Starts accepting client connections.
 func (ms *ModbusServer) Start() (err error) {
+	var spw		*serialPortWrapper
+
 	ms.lock.Lock()
 	defer ms.lock.Unlock()
 
@@ -161,6 +203,30 @@ func (ms *ModbusServer) Start() (err error) {
 	}
 
 	switch ms.transportType {
+	case RTU_TRANSPORT:
+		// create a serial port wrapper object
+		spw = newSerialPortWrapper(&serialPortConfig{
+			Device:		ms.conf.URL,
+			Speed:		ms.conf.Speed,
+			DataBits:	ms.conf.DataBits,
+			Parity:		ms.conf.Parity,
+			StopBits:	ms.conf.StopBits,
+		})
+
+		// open the serial device
+		err = spw.Open()
+		if err != nil {
+			return
+		}
+
+		// discard potentially stale serial data
+		discard(spw)
+
+		// create the RTU transport and pass it to the handler goroutine
+		go ms.handleTransport(
+			newRTUTransport(
+				spw, ms.conf.URL, ms.conf.Speed, ms.conf.Timeout))
+
 	case TCP_TRANSPORT:
 		// bind to a TCP socket
 		ms.tcpListener, err	= net.Listen("tcp", ms.conf.URL)
@@ -186,15 +252,11 @@ func (ms *ModbusServer) Stop() (err error) {
 	ms.lock.Lock()
 	defer ms.lock.Unlock()
 
-	if !ms.started {
-		return
-	}
-
 	ms.started = false
 
 	if ms.transportType == TCP_TRANSPORT {
 		// close the server socket if we're listening over TCP
-		err	= ms.tcpListener.Close()
+		ms.tcpListener.Close()
 
 		// close all active TCP clients
 		for _, sock := range ms.tcpClients{
@@ -285,13 +347,41 @@ func (ms *ModbusServer) handleTransport(t transport) {
 	var req		*pdu
 	var res		*pdu
 	var err		error
+	var found	bool
 	var addr	uint16
 	var quantity	uint16
 
 	for {
 		req, err = t.ReadRequest()
 		if err != nil {
-			return
+			// on RTU links, skip the frame. On TCP links, return to close the
+			// connection.
+			if ms.transportType == RTU_TRANSPORT {
+				continue
+			} else {
+				return
+			}
+		}
+
+		// only accept unit IDs of interest on shared RTU links.
+		// on TCP links, the endpoint is clearly identified by its IP address and
+		// port, so passing all requests regardless of their unit ID to the handler
+		// is appropriate.
+		if ms.transportType == RTU_TRANSPORT {
+			found = false
+
+			// loop through the accepted unit ID list
+			for _, uid := range ms.conf.AcceptedUnitIds {
+				if uid == req.unitId {
+					found = true
+					break
+				}
+			}
+
+			// if we found no match, stay silent as this request wasn't for us
+			if !found {
+				continue
+			}
 		}
 
 		switch req.functionCode {
